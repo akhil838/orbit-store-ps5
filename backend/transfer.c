@@ -48,10 +48,15 @@ typedef struct Transfer {
     DownloadHealth health;
     int64_t network_bytes;
     bool stalled;
+    /* Window requests: a lower end set when another connection takes the rest
+     * of this range; `limit` stays the requested end for response validation. */
+    int64_t stop;
+    double last_rx;
 #ifdef ORBIT_BENCHMARK
     int64_t sample_span;
     double deadline;
     long socket_buffer, curl_buffer;
+    unsigned fixed_connections;
     int socket_before, socket_after, socket_error;
     cJSON *metrics;
     cJSON *speed_samples;
@@ -279,22 +284,31 @@ static size_t body(char *data, size_t a, size_t b, void *arg) {
     }
     if (controlled(t))
         return 0;
-    if (t->offset + t->written + (int64_t)n > t->limit) {
-        copy_text(t->error, sizeof t->error, "Provider sent more bytes than expected.");
-        return 0;
+    /* A split window request keeps its validated response but ends early: keep
+     * the bytes up to its stop point, then end the request deliberately. */
+    int64_t end = t->stop ? t->stop : t->limit;
+    bool trimmed = false;
+    if (t->offset + t->written + (int64_t)n > end) {
+        if (!t->stop || !t->window_buffer) {
+            copy_text(t->error, sizeof t->error, "Provider sent more bytes than expected.");
+            return 0;
+        }
+        n = (size_t)(end - t->offset - t->written);
+        trimmed = true;
     }
     if (t->range_probe) {
         t->written += (int64_t)n;
         return n;
     }
-    /* USB ranges stay in a bounded memory window until the entire response
-     * validates. Only adjacent, verified bytes are handed to the disk writer. */
+    /* Window requests stay in bounded memory until their whole piece is
+     * present. Only adjacent, verified bytes are handed to the disk writer. */
     Transfer *owner = t->owner ? t->owner : t;
     owner->network_bytes += (int64_t)n;
     if (t->window_buffer) {
         memcpy(t->window_buffer + t->written, data, n);
         t->written += (int64_t)n;
-        return n;
+        t->last_rx = seconds();
+        return trimmed ? 0 : n;
     }
     if (owner->error[0])
         return 0;
@@ -498,237 +512,537 @@ int transfer_validate_capture(Release *release, atomic_bool *cancel, char *etag,
     copy_text(modified, 128, owner.modified);
     return 0;
 }
-/* Shared validation/cancellation for full-file ranges and bounded USB windows. */
-static CURLcode perform_ranges(Transfer *owner, Transfer *parts, CURL **handles,
-                               CURLM *multi, unsigned count) {
-    CURLcode result = CURLE_OK;
+/* Pipelined window engine for every ranged download.
+ *
+ * The PS5 keeps each TCP connection slow on long paths that reorder packets:
+ * Archive.org holds near 0.2 MB/s per connection whatever its receive buffer,
+ * while the same path gives a desktop several MB/s. Throughput therefore comes
+ * from many independent range requests, not from bigger ones.
+ *
+ * Requests fetch fixed pieces of a bounded window ahead of the durable cursor.
+ * A finished connection immediately takes the next piece; nothing waits for its
+ * siblings. When no new piece may start, an idle connection takes the second
+ * half of the most urgent unfinished range, so one slow response cannot hold the
+ * window or the end of the file. Transient failures retry only the missing
+ * bytes. Bytes reach the writer strictly in file order, so exFAT never has to
+ * allocate a gap and every saved range stays one contiguous cursor.
+ *
+ * Direct hosts start with 16 connections and add more while total throughput
+ * keeps improving, halving on throttling. Browser-captured and debrid links
+ * keep their previous eight-connection limit. */
+#define WINDOW_PIECE ((int64_t)1024 * 1024) /* equals the legacy writer slice */
+#define WINDOW_MAX_CONNECTIONS 64
+#define WINDOW_SLACK 8
+#define WINDOW_PIECES (WINDOW_MAX_CONNECTIONS + WINDOW_SLACK)
+#define WINDOW_MIN_SPLIT ((int64_t)128 * 1024)
+#define WINDOW_GAPS 256
+#define WINDOW_GAP_TRIES 8
+#define WINDOW_NO_PROGRESS 180.0
+#define WINDOW_IDLE_SECONDS 25.0
+#define WINDOW_LONG_THROTTLE 120
+static bool retryable(long status, CURLcode rc);
+typedef struct { int64_t start, length, done; unsigned char *data; } WindowPiece;
+typedef struct { int64_t from, to; WindowPiece *piece; unsigned tries; double not_before; } WindowGap;
+typedef struct {
+    Transfer part;
+    CURL *handle;
+    WindowPiece *piece;
+    unsigned tries;
+    bool busy, pinned;
+#ifdef ORBIT_BENCHMARK
+    int64_t bytes;
+    bool used, rejected;
+#endif
+} WindowSlot;
+typedef enum { CONTROL_SETTLE, CONTROL_MEASURE, CONTROL_HOLD } ControlPhase;
+typedef struct {
+    unsigned connections, minimum, maximum, best, ticks, starved;
+    unsigned cap; /* learned host limit for this download; 0 until it pushes back */
+    bool adaptive;
+    ControlPhase phase;
+    double until, from, best_rate, backoff_at;
+    int64_t from_bytes;
+} WindowControl;
+typedef struct {
+    Transfer *owner;
+    struct curl_slist *conditions;
+    CURLM *multi;
+    WindowSlot slots[WINDOW_MAX_CONNECTIONS];
+    WindowPiece pieces[WINDOW_PIECES]; /* ring of unwritten pieces in file order */
+    unsigned head, count;
+    WindowGap gaps[WINDOW_GAPS];
+    unsigned gap_count, active, published, burst;
+    double progress_at, burst_at;
+    size_t writer_slice;
+    unsigned ceiling;
+    double budget_at;
+    WindowControl control;
+    char pin[sizeof(((Release *)0)->url)];
+} Window;
+
+static void control_init(WindowControl *c, unsigned start, unsigned maximum, bool adaptive, double now) {
+    *c = (WindowControl){.connections = start, .minimum = start < 4 ? start : 4, .maximum = maximum,
+                         .best = start, .adaptive = adaptive,
+                         .phase = CONTROL_SETTLE, .until = now + 4};
+}
+/* The host pushed back (throttling, 5xx or resets from many requests at once):
+ * halve once per event and keep three quarters of the count that triggered it
+ * as this download's ceiling, so the hill-climb stops probing into the limit. */
+static void control_backoff(WindowControl *c, double now, double hold) {
+    if (now < c->backoff_at) return;
+    c->backoff_at = now + 10;
+    unsigned limit = c->connections * 3 / 4;
+    if (limit < c->minimum) limit = c->minimum;
+    if (!c->cap || limit < c->cap) c->cap = limit;
+    if (c->maximum > c->cap) c->maximum = c->cap;
+    unsigned half = c->connections / 2;
+    c->connections = half > c->minimum ? half : c->minimum;
+    c->best = c->connections;
+    c->best_rate = 0;
+    c->phase = CONTROL_HOLD;
+    c->until = now + hold;
+}
+/* Hill-climb on measured throughput: settle after a change, measure, keep the
+ * new count only if it gained at least 8%, then re-probe after a hold. A sample
+ * where requests could not fill the connection budget (file tail, a full window)
+ * says nothing about more connections and never raises the count. */
+static void control_tick(WindowControl *c, double now, int64_t bytes, unsigned active, bool tail) {
+    if (!c->adaptive) return;
+    if (c->phase == CONTROL_MEASURE) {
+        c->ticks++;
+        if (active < c->connections) c->starved++;
+    }
+    if (now < c->until) return;
+    if (c->phase == CONTROL_SETTLE) {
+        c->phase = CONTROL_MEASURE;
+        c->from = now;
+        c->from_bytes = bytes;
+        c->ticks = c->starved = 0;
+        c->until = now + 8;
+    } else if (c->phase == CONTROL_MEASURE) {
+        double rate = (double)(bytes - c->from_bytes) / (now - c->from);
+        bool starved = tail || (c->ticks && c->starved * 10 > c->ticks * 3);
+        if (!starved && (c->best_rate <= 0 || rate > c->best_rate * 1.08)) {
+            c->best_rate = rate;
+            c->best = c->connections;
+            if (c->connections < c->maximum) {
+                unsigned step = c->connections / 2 > 4 ? c->connections / 2 : 4;
+                c->connections = c->maximum - c->connections > step ? c->connections + step : c->maximum;
+                c->phase = CONTROL_SETTLE;
+                c->until = now + 4;
+            } else {
+                c->phase = CONTROL_HOLD;
+                c->until = now + 60;
+            }
+        } else {
+            if (!starved) c->connections = c->best;
+            c->phase = CONTROL_HOLD;
+            c->until = now + (starved ? 15 : 45);
+        }
+    } else {
+        c->best_rate = 0;
+        c->phase = CONTROL_SETTLE;
+        c->until = now + 4;
+    }
+}
+/* Downloads in progress share one connection budget instead of each opening
+ * the maximum; rechecked while running as other downloads start and finish. */
+static unsigned window_share(unsigned ceiling) {
+    unsigned downloading = 0;
+    pthread_mutex_lock(&orbit.mutex);
+    for (size_t i = 0; i < orbit.job_count; i++)
+        if (!strcmp(orbit.jobs[i].status, "downloading")) downloading++;
+    pthread_mutex_unlock(&orbit.mutex);
+    unsigned share = ceiling / (downloading ? downloading : 1);
+    unsigned floor = ceiling < 8 ? ceiling : 8;
+    return share > floor ? share : floor;
+}
+static void control_budget(WindowControl *c, unsigned share) {
+    c->maximum = c->cap && c->cap < share ? c->cap : share;
+    if (c->connections > c->maximum) c->connections = c->maximum;
+    if (c->best > c->maximum) c->best = c->maximum;
+}
+static void window_limits(const Transfer *owner, unsigned *start, unsigned *maximum, bool *adaptive) {
+    bool direct = !guarded(owner);
+    unsigned most = direct ? WINDOW_MAX_CONNECTIONS : 8;
+    unsigned first = download_connections(direct ? 16 : 8, owner->job->attempts);
+    if (first > most) first = most;
+    bool grow = direct;
+#ifdef ORBIT_TEST
+    const char *fixed = getenv("ORBIT_TEST_CONNECTIONS");
+    const char *ceiling = getenv("ORBIT_TEST_MAX_CONNECTIONS");
+    if (ceiling && atoi(ceiling) >= 1 && atoi(ceiling) <= WINDOW_MAX_CONNECTIONS) {
+        most = (unsigned)atoi(ceiling);
+        if (first > most) first = most;
+    }
+    if (fixed && atoi(fixed) >= 1 && atoi(fixed) <= WINDOW_MAX_CONNECTIONS) {
+        first = most = (unsigned)atoi(fixed);
+        grow = false;
+    }
+#endif
+#ifdef ORBIT_BENCHMARK
+    if (owner->fixed_connections) {
+        first = most = owner->fixed_connections;
+        grow = false;
+    }
+#endif
+    *start = first;
+    *maximum = most;
+    *adaptive = grow;
+}
+static void window_publish(Window *w) {
+    if (w->published == w->control.connections) return;
+    w->published = w->control.connections;
+    pthread_mutex_lock(&orbit.mutex);
+    w->owner->job->transfer_connections = w->published;
+    pthread_mutex_unlock(&orbit.mutex);
+}
+static WindowPiece *window_piece(Window *w, unsigned k) { return &w->pieces[(w->head + k) % WINDOW_PIECES]; }
+static WindowPiece *window_new_piece(Window *w, int64_t start, int64_t length) {
+    if (w->count >= WINDOW_PIECES) return NULL;
+    unsigned char *data = malloc((size_t)length);
+    if (!data) return NULL;
+    WindowPiece *p = window_piece(w, w->count++);
+    *p = (WindowPiece){start, length, 0, data};
+    return p;
+}
+/* Only Archive.org storage servers (and loopback fixtures) are pinned: later
+ * requests skip the redirect while the account cookie still applies. */
+static bool window_pin_allowed(const char *url) {
+#ifdef ORBIT_TEST
+    if (!strncmp(url, "http://127.0.0.1:", 17)) return true;
+#endif
+    char *scheme = NULL, *host = NULL;
+    CURLU *parsed = curl_url();
+    bool allowed = parsed && !curl_url_set(parsed, CURLUPART_URL, url, 0) &&
+        !curl_url_get(parsed, CURLUPART_SCHEME, &scheme, 0) &&
+        !curl_url_get(parsed, CURLUPART_HOST, &host, 0) && !strcmp(scheme, "https");
+    if (allowed) {
+        size_t n = strlen(host);
+        allowed = n > 12 && !strcasecmp(host + n - 12, ".archive.org");
+    }
+    curl_free(scheme);
+    curl_free(host);
+    curl_url_cleanup(parsed);
+    return allowed;
+}
+static void window_pin(Window *w, WindowSlot *s) {
+    if (w->pin[0] || s->pinned || guarded(w->owner) || strcmp(w->owner->release->source, "archive")) return;
+    char *url = NULL;
+    if (curl_easy_getinfo(s->handle, CURLINFO_EFFECTIVE_URL, &url) != CURLE_OK || !url ||
+        !strcmp(url, w->owner->release->url) || strlen(url) >= sizeof w->pin || !window_pin_allowed(url))
+        return;
+    copy_text(w->pin, sizeof w->pin, url);
+}
+static int window_start(Window *w, WindowSlot *s, unsigned segment, WindowPiece *p, int64_t from,
+                        int64_t to, unsigned tries) {
+    Transfer *owner = w->owner, *t = &s->part;
+    if (!s->handle) {
+        *t = (Transfer){.job = owner->job, .release = owner->release, .fd = owner->fd, .owner = owner};
+        s->handle = request(t);
+        if (!s->handle) return -1;
+    }
+    t->status = 0;
+    t->length = t->start = t->end = t->total = -1;
+    t->etag[0] = t->modified[0] = t->type[0] = t->error[0] = t->disposition[0] = 0;
+    t->retry_at = 0;
+    t->accepted = false;
+    t->segment = (int)segment;
+    t->offset = from;
+    t->limit = to;
+    t->stop = 0;
+    t->written = 0;
+    t->window_buffer = p->data + (from - p->start);
+    t->last_rx = seconds();
+    s->pinned = w->pin[0] != 0;
+    curl_easy_setopt(s->handle, CURLOPT_URL, s->pinned ? w->pin : owner->release->url);
+    set_range(s->handle, from, to, w->conditions);
+    if (curl_multi_add_handle(w->multi, s->handle) != CURLM_OK) return -1;
+    s->busy = true;
+    s->piece = p;
+    s->tries = tries;
+    w->active++;
+    return 0;
+}
+static void window_stop(Window *w, WindowSlot *s) {
+    curl_multi_remove_handle(w->multi, s->handle);
+    s->busy = false;
+    w->active--;
+}
+static bool window_take_gap(Window *w, double now, WindowGap *out) {
+    unsigned chosen = w->gap_count;
+    for (unsigned i = 0; i < w->gap_count; i++)
+        if (w->gaps[i].not_before <= now && (chosen == w->gap_count || w->gaps[i].from < w->gaps[chosen].from))
+            chosen = i;
+    if (chosen == w->gap_count) return false;
+    *out = w->gaps[chosen];
+    w->gaps[chosen] = w->gaps[--w->gap_count];
+    return true;
+}
+/* Give an idle connection the second half of the most urgent unfinished range:
+ * one in the piece the writer is waiting for first, otherwise the longest. */
+static bool window_split(Window *w, WindowGap *out) {
+    WindowPiece *head = w->count ? window_piece(w, 0) : NULL;
+    WindowSlot *victim = NULL;
+    int64_t longest = 0;
+    bool victim_in_head = false;
+    for (unsigned i = 0; i < WINDOW_MAX_CONNECTIONS; i++) {
+        WindowSlot *s = &w->slots[i];
+        if (!s->busy) continue;
+        Transfer *t = &s->part;
+        int64_t end = t->stop ? t->stop : t->limit, left = end - (t->offset + t->written);
+        if (left < 2 * WINDOW_MIN_SPLIT) continue;
+        bool in_head = s->piece == head;
+        if ((in_head && !victim_in_head) || (in_head == victim_in_head && left > longest)) {
+            victim = s;
+            longest = left;
+            victim_in_head = in_head;
+        }
+    }
+    if (!victim) return false;
+    Transfer *t = &victim->part;
+    int64_t end = t->stop ? t->stop : t->limit, done = t->offset + t->written;
+    int64_t middle = done + (end - done) / 2;
+    t->stop = middle;
+    *out = (WindowGap){.from = middle, .to = end, .piece = victim->piece};
+    return true;
+}
+static int window_fail(Window *w, const Transfer *t, CURLcode code, const char *fallback) {
+    Transfer *owner = w->owner;
+    owner->status = t->status;
+    if (t->retry_at > owner->retry_at) owner->retry_at = t->retry_at;
+    if (owner->error[0]) return -1;
+    if (t->error[0])
+        copy_text(owner->error, sizeof owner->error, t->error);
+    else if (fallback)
+        copy_text(owner->error, sizeof owner->error, fallback);
+    else
+        snprintf(owner->error, sizeof owner->error, "Transfer failed (HTTP %ld, %s).", t->status,
+                 curl_easy_strerror(code));
+    return -1;
+}
+/* Queue the bytes a request did not deliver. Only these are fetched again. */
+static int window_retry(Window *w, WindowSlot *s, CURLcode code, double not_before) {
+    Transfer *t = &s->part;
+    int64_t from = t->offset + t->written, to = t->stop ? t->stop : t->limit;
+    if (from >= to) return 0;
+    unsigned tries = s->tries + 1;
+    if (tries > WINDOW_GAP_TRIES || seconds() - w->progress_at > WINDOW_NO_PROGRESS)
+        return window_fail(w, t, code, NULL);
+    if (w->gap_count == WINDOW_GAPS)
+        return window_fail(w, t, code, "Too many interrupted requests. Partial file preserved.");
+    w->gaps[w->gap_count++] = (WindowGap){from, to, s->piece, tries, not_before};
+    return 0;
+}
+static int window_finished(Window *w, WindowSlot *s, CURLcode code, double now) {
+    Transfer *owner = w->owner, *t = &s->part;
+    window_stop(w, s);
+    int64_t end = t->stop ? t->stop : t->limit;
+    s->piece->done += t->written;
+#ifdef ORBIT_BENCHMARK
+    s->used = true;
+    s->bytes += t->written;
+    if (!t->accepted) s->rejected = true;
+#endif
+    if (t->accepted && t->offset + t->written == end && (code == CURLE_OK || t->stop)) {
+        window_pin(w, s);
+        return 0;
+    }
+    if (controlled(owner) || owner->stalled) return -1;
+    if (t->status == 429 || t->status == 503) {
+        time_t wall = time(NULL);
+        double wait = t->retry_at > wall ? (double)(t->retry_at - wall) : 10;
+        if (wait > WINDOW_LONG_THROTTLE) return window_fail(w, t, code, NULL);
+        control_backoff(&w->control, now, WINDOW_LONG_THROTTLE);
+        return window_retry(w, s, code, now + wait);
+    }
+    if (retryable(t->status, code) || code == CURLE_SSL_CONNECT_ERROR || code == CURLE_HTTP2 ||
+        code == CURLE_HTTP2_STREAM) {
+        /* A storage server in trouble: go back through the redirecting URL. */
+        if (s->pinned) w->pin[0] = 0;
+        /* A lone failure is noise; many within seconds mean the host is
+         * overloaded by this download's own connections. */
+        if (now - w->burst_at > 5) {
+            w->burst_at = now;
+            w->burst = 0;
+        }
+        unsigned threshold = w->control.connections / 8 > 3 ? w->control.connections / 8 : 3;
+        if (++w->burst >= threshold) control_backoff(&w->control, now, 60);
+        unsigned shift = s->tries < 5 ? s->tries : 5;
+        return window_retry(w, s, code, now + (double)(1u << shift));
+    }
+    return window_fail(w, t, code, NULL);
+}
+/* A connection that delivers nothing for a while is replaced; its range is
+ * requeued immediately rather than waiting for curl's own timeouts. */
+static int window_recycle(Window *w, double now) {
+    for (unsigned i = 0; i < WINDOW_MAX_CONNECTIONS; i++) {
+        WindowSlot *s = &w->slots[i];
+        if (!s->busy || now - s->part.last_rx < WINDOW_IDLE_SECONDS) continue;
+        window_stop(w, s);
+        s->piece->done += s->part.written;
+        if (s->pinned) w->pin[0] = 0;
+        if (window_retry(w, s, CURLE_OPERATION_TIMEDOUT, now)) return -1;
+    }
+    return 0;
+}
+static int window_flush(Window *w, unsigned segment) {
+    Transfer *owner = w->owner;
+    while (w->count && window_piece(w, 0)->done == window_piece(w, 0)->length) {
+        WindowPiece *p = window_piece(w, 0);
+        double before = seconds();
+        for (int64_t sent = 0; sent < p->length;) {
+            size_t size = (size_t)(p->length - sent);
+            if (size > w->writer_slice) size = w->writer_slice;
+            if (transfer_writer_enqueue(owner->writer, segment, p->data + sent, size)) return -1;
+            sent += (int64_t)size;
+        }
+        if (seconds() - before > 0.25)
+            owner->health = (DownloadHealth){seconds(), owner->network_bytes};
+        owner->live[segment] += p->length;
+#ifdef ORBIT_BENCHMARK
+        owner->enqueued += p->length;
+        if (owner->speed_samples && seconds() - owner->last_sample >= 1) {
+            owner->last_sample = seconds();
+            cJSON *sample = cJSON_CreateObject();
+            cJSON_AddNumberToObject(sample, "seconds", owner->last_sample - owner->started);
+            cJSON_AddNumberToObject(sample, "bytes", (double)owner->enqueued);
+            cJSON_AddItemToArray(owner->speed_samples, sample);
+        }
+#endif
+        free(p->data);
+        p->data = NULL;
+        w->head = (w->head + 1) % WINDOW_PIECES;
+        w->count--;
+        w->progress_at = seconds();
+    }
+    return 0;
+}
+static CURLcode window_segment(Window *w, unsigned segment, int64_t cursor, int64_t limit) {
+    Transfer *owner = w->owner;
+    int64_t next = cursor;
     for (;;) {
-        if (controlled(owner) || owner->error[0]) {
-            result = CURLE_ABORTED_BY_CALLBACK;
-            break;
+        double now = seconds();
+        if (controlled(owner) || owner->error[0] || owner->stalled) return CURLE_ABORTED_BY_CALLBACK;
+        for (unsigned i = 0; i < WINDOW_MAX_CONNECTIONS && w->active < w->control.connections; i++) {
+            WindowSlot *s = &w->slots[i];
+            if (s->busy) continue;
+            WindowGap gap;
+            WindowPiece *p = NULL;
+            int started;
+            if (window_take_gap(w, now, &gap)) {
+                started = window_start(w, s, segment, gap.piece, gap.from, gap.to, gap.tries);
+            } else if (next < limit && w->count < w->control.connections + WINDOW_SLACK &&
+                       (p = window_new_piece(w, next, limit - next < WINDOW_PIECE ? limit - next : WINDOW_PIECE))) {
+                started = window_start(w, s, segment, p, next, next + p->length, 0);
+                next += p->length;
+            } else if (window_split(w, &gap)) {
+                started = window_start(w, s, segment, gap.piece, gap.from, gap.to, 0);
+            } else {
+                break;
+            }
+            if (started) {
+                copy_text(owner->error, sizeof owner->error, "Could not start a download connection.");
+                return CURLE_FAILED_INIT;
+            }
+        }
+        if (!w->active && !w->gap_count && !w->count && next >= limit) return CURLE_OK;
+        if (!w->active && !w->gap_count && w->count && next >= limit) {
+            copy_text(owner->error, sizeof owner->error, "Download window lost track of a range.");
+            return CURLE_FAILED_INIT;
         }
         int running = 0;
-        CURLMcode rc = curl_multi_perform(multi, &running);
-        if (rc != CURLM_OK) {
-            result = CURLE_FAILED_INIT;
-            break;
-        }
-        int remaining;
+        if (curl_multi_perform(w->multi, &running) != CURLM_OK) return CURLE_FAILED_INIT;
         CURLMsg *message;
-        while ((message = curl_multi_info_read(multi, &remaining))) {
-            if (message->msg != CURLMSG_DONE)
-                continue;
-            for (unsigned i = 0; i < count; i++) {
-                Transfer *part = &parts[i];
-                if (message->easy_handle != handles[i])
-                    continue;
-                if (message->data.result != CURLE_OK || !part->accepted ||
-                    part->offset + part->written != part->limit) {
-                    if (part->retry_at > owner->retry_at)
-                        owner->retry_at = part->retry_at;
-                    /* A sibling cancelled after a failure must not replace the
-                     * provider's throttling status with its callback error. */
-                    if (result != CURLE_OK && part->status != 429 && part->status != 503)
-                        continue;
-                    result = message->data.result == CURLE_OK
-                                 ? (part->accepted ? CURLE_PARTIAL_FILE : CURLE_RANGE_ERROR)
-                                 : message->data.result;
-                    owner->status = part->status;
-                    if (!owner->error[0]) {
-                        if (part->error[0])
-                            copy_text(owner->error, sizeof owner->error, part->error);
-                        else
-                            snprintf(owner->error, sizeof owner->error,
-                                     "Transfer failed (HTTP %ld, %s).", part->status,
-                                     curl_easy_strerror(result));
-                    }
-                }
+        int left;
+        while ((message = curl_multi_info_read(w->multi, &left))) {
+            if (message->msg != CURLMSG_DONE) continue;
+            CURL *handle = message->easy_handle;
+            CURLcode code = message->data.result;
+            for (unsigned i = 0; i < WINDOW_MAX_CONNECTIONS; i++) {
+                WindowSlot *s = &w->slots[i];
+                if (!s->busy || s->handle != handle) continue;
+                if (window_finished(w, s, code, seconds()))
+                    return owner->error[0] ? CURLE_RECV_ERROR : CURLE_ABORTED_BY_CALLBACK;
+                break;
             }
         }
-        if (result != CURLE_OK || !running)
-            break;
-        if (curl_multi_poll(multi, NULL, 0, 200, NULL) != CURLM_OK) {
-            result = CURLE_FAILED_INIT;
-            break;
+        if (window_flush(w, segment)) return CURLE_ABORTED_BY_CALLBACK;
+        now = seconds();
+        if (window_recycle(w, now)) return CURLE_RECV_ERROR;
+        control_tick(&w->control, now, owner->network_bytes, w->active, next >= limit && !w->gap_count);
+        if (w->control.adaptive && now >= w->budget_at) {
+            control_budget(&w->control, window_share(w->ceiling));
+            w->budget_at = now + 5;
         }
+        window_publish(w);
+        if (curl_multi_poll(w->multi, NULL, 0, 200, NULL) != CURLM_OK) return CURLE_FAILED_INIT;
     }
-    return result;
 }
-static CURLcode run_ranges(Transfer *owner, struct curl_slist *conditions) {
-    /* Independent bounded requests on one network worker; a separate writer
-     * coalesces their buffers and owns all writes/checkpoints. */
+static CURLcode run_window(Transfer *owner, struct curl_slist *conditions) {
+    Window *w = calloc(1, sizeof *w);
     CURLM *multi = curl_multi_init();
-    unsigned count = owner->job->range_count;
-    CURL *handles[ORBIT_MAX_RANGES] = {0};
-    bool added[ORBIT_MAX_RANGES] = {false};
-    Transfer parts[ORBIT_MAX_RANGES] = {0};
     CURLcode result = CURLE_OK;
-    if (!multi) {
+    if (!w || !multi) {
         copy_text(owner->error, sizeof owner->error, "Could not initialize parallel transfer.");
-        return CURLE_FAILED_INIT;
+        result = CURLE_OUT_OF_MEMORY;
+        goto done;
     }
-    curl_multi_setopt(multi, CURLMOPT_MAX_TOTAL_CONNECTIONS, (long)download_connections(count, owner->job->attempts));
-    curl_multi_setopt(multi, CURLMOPT_MAX_HOST_CONNECTIONS, (long)download_connections(count, owner->job->attempts));
+    w->owner = owner;
+    w->conditions = conditions;
+    w->multi = multi;
+    w->writer_slice = TRANSFER_BUFFER_BYTES / owner->job->range_count;
+    unsigned start, maximum;
+    bool adaptive;
+    window_limits(owner, &start, &maximum, &adaptive);
+    w->ceiling = maximum;
+    if (adaptive) {
+        maximum = window_share(w->ceiling);
+        if (start > maximum) start = maximum;
+    }
+    control_init(&w->control, start, maximum, adaptive, seconds());
+    w->budget_at = seconds() + 5;
+    w->progress_at = seconds();
+    window_publish(w);
+    curl_multi_setopt(multi, CURLMOPT_MAX_TOTAL_CONNECTIONS, (long)w->ceiling);
+    curl_multi_setopt(multi, CURLMOPT_MAX_HOST_CONNECTIONS, (long)w->ceiling);
+    curl_multi_setopt(multi, CURLMOPT_MAXCONNECTS, (long)w->ceiling);
     curl_multi_setopt(multi, CURLMOPT_PIPELINING, 0L);
-    for (unsigned i = 0; i < count; i++) {
-        int64_t base = range_boundary(transfer_span(owner), count, i);
-        int64_t limit = range_boundary(transfer_span(owner), count, i + 1);
-        parts[i] = (Transfer){.job = owner->job,
-                              .release = owner->release,
-                              .fd = owner->fd,
-                              .owner = owner,
-                              .segment = i,
-                              .offset = base + owner->live[i],
-                              .limit = limit};
-        if (parts[i].offset == limit)
-            continue;
-        handles[i] = request(&parts[i]);
-        if (!handles[i]) {
-            result = CURLE_FAILED_INIT;
-            goto cleanup;
-        }
-        set_range(handles[i], parts[i].offset, limit, conditions);
-    }
-    unsigned connections = download_connections(count, owner->job->attempts);
-    for (unsigned first = 0; first < count; first += connections) {
-        unsigned end = first + connections < count ? first + connections : count;
-        for (unsigned i = first; i < end; i++) {
-            if (!handles[i]) continue;
-            if (curl_multi_add_handle(multi, handles[i]) != CURLM_OK) {
-                result = CURLE_FAILED_INIT;
-                goto cleanup;
-            }
-            added[i] = true;
-        }
-        result = perform_ranges(owner, parts, handles, multi, count);
-        for (unsigned i = first; i < end; i++) {
-            if (added[i]) curl_multi_remove_handle(multi, handles[i]);
-            added[i] = false;
-        }
-        if (result != CURLE_OK) break;
-    }
-cleanup:
-    for (unsigned i = 0; i < count; i++) {
-#ifdef ORBIT_BENCHMARK
-        if (handles[i] && owner->metrics) {
-            cJSON *m = cJSON_CreateObject();
-            cJSON_AddItemToArray(owner->metrics, m);
-            cJSON_AddNumberToObject(m, "range", i);
-            cJSON_AddNumberToObject(m, "bytes", (double)parts[i].written);
-            cJSON_AddNumberToObject(m, "httpStatus", parts[i].status);
-            cJSON_AddBoolToObject(m, "validated", parts[i].accepted);
-            cJSON_AddNumberToObject(m, "socketBufferBefore", parts[i].socket_before);
-            cJSON_AddNumberToObject(m, "socketBufferAfter", parts[i].socket_after);
-            cJSON_AddNumberToObject(m, "socketOptionError", parts[i].socket_error);
-            double value = 0;
-            curl_easy_getinfo(handles[i], CURLINFO_NAMELOOKUP_TIME, &value);
-            cJSON_AddNumberToObject(m, "dnsSeconds", value);
-            curl_easy_getinfo(handles[i], CURLINFO_CONNECT_TIME, &value);
-            cJSON_AddNumberToObject(m, "connectSeconds", value);
-            curl_easy_getinfo(handles[i], CURLINFO_STARTTRANSFER_TIME, &value);
-            cJSON_AddNumberToObject(m, "firstByteSeconds", value);
-            char *url = NULL, *host = NULL;
-            CURLU *parsed = curl_url();
-            curl_easy_getinfo(handles[i], CURLINFO_EFFECTIVE_URL, &url);
-            if (parsed && url && !curl_url_set(parsed, CURLUPART_URL, url, 0) &&
-                !curl_url_get(parsed, CURLUPART_HOST, &host, 0))
-                cJSON_AddStringToObject(m, "server", host);
-            curl_free(host); curl_url_cleanup(parsed);
-        }
-#endif
-        if (added[i])
-            curl_multi_remove_handle(multi, handles[i]);
-        if (handles[i])
-            curl_easy_cleanup(handles[i]);
-    }
-    curl_multi_cleanup(multi);
-    if (result != CURLE_OK && !owner->error[0])
-        snprintf(owner->error, sizeof owner->error, "Transfer interrupted: %s.",
-                 curl_easy_strerror(result));
-    return result;
-}
-
-/* exFAT USB writes cannot cheaply leave holes. Requesting eighths of a large
- * game writes tens of GB ahead and can block the entire volume while the gap
- * is allocated. Keep eight network requests, but bound their combined span to
- * 8 MiB and feed the existing writer in ascending order. The multi handle keeps
- * connections reusable across windows. Memory is capped at 8 MiB in addition
- * to the writer's 8 MiB queue; checkpoints still cover flushed bytes only. */
-static bool usb_destination(const Job *j) {
-#ifdef ORBIT_TEST
-    const char *usb = getenv("ORBIT_TEST_USB_STORAGE");
-    if (usb && !strcmp(usb, "1")) return true;
-#endif
-    return !strncmp(j->storage_id, "usb", 3) && strlen(j->storage_id) == 4 &&
-           j->storage_id[3] >= '0' && j->storage_id[3] <= '7' &&
-           !strncmp(j->root, "/mnt/usb", 8) && strlen(j->root) == 9 &&
-           j->root[8] == j->storage_id[3];
-}
-static CURLcode run_usb_ranges(Transfer *owner, struct curl_slist *conditions) {
-    const unsigned connections = download_connections(ORBIT_MAX_RANGES, owner->job->attempts);
-    const size_t chunk = TRANSFER_BUFFER_BYTES / ORBIT_MAX_RANGES;
-    unsigned char *memory = malloc(TRANSFER_BUFFER_BYTES);
-    CURLM *multi = curl_multi_init();
-    CURLcode result = CURLE_OK;
-    if (!memory || !multi) { result = CURLE_OUT_OF_MEMORY; goto done; }
-    curl_multi_setopt(multi, CURLMOPT_MAX_TOTAL_CONNECTIONS, (long)connections);
-    curl_multi_setopt(multi, CURLMOPT_MAX_HOST_CONNECTIONS, (long)connections);
-    curl_multi_setopt(multi, CURLMOPT_PIPELINING, 0L);
-    /* Keep old segmented partials intact. Fill each saved range from its own
-     * durable cursor; never reinterpret st_size as downloaded progress. */
-    for (unsigned segment = 0; segment < owner->job->range_count; segment++) {
+    /* Older partials may have several saved ranges; fill each from its own
+     * durable cursor. New downloads use one range. */
+    for (unsigned segment = 0; segment < owner->job->range_count && result == CURLE_OK; segment++) {
         int64_t base = range_boundary(transfer_span(owner), owner->job->range_count, segment);
         int64_t limit = range_boundary(transfer_span(owner), owner->job->range_count, segment + 1);
         int64_t cursor = base + owner->live[segment];
-        while (cursor < limit) {
-            if (controlled(owner)) { result = CURLE_ABORTED_BY_CALLBACK; goto done; }
-            CURL *handles[ORBIT_MAX_RANGES] = {0};
-            bool added[ORBIT_MAX_RANGES] = {false};
-            Transfer parts[ORBIT_MAX_RANGES] = {0};
-            unsigned count = 0;
-            int64_t next = cursor;
-            for (; count < connections && next < limit; count++) {
-                int64_t end = limit - next < (int64_t)chunk ? limit : next + (int64_t)chunk;
-                parts[count] = (Transfer){.job = owner->job, .release = owner->release,
-                    .fd = owner->fd, .owner = owner, .segment = (int)segment,
-                    .offset = next, .limit = end, .window_buffer = memory + count * chunk};
-                handles[count] = request(&parts[count]);
-                if (!handles[count]) { result = CURLE_FAILED_INIT; break; }
-                set_range(handles[count], next, end, conditions);
-                if (curl_multi_add_handle(multi, handles[count]) != CURLM_OK) {
-                    result = CURLE_FAILED_INIT; break;
-                }
-                added[count] = true;
-                next = end;
-            }
-            if (result == CURLE_OK)
-                result = perform_ranges(owner, parts, handles, multi, count);
-            for (unsigned i = 0; i < ORBIT_MAX_RANGES; i++) {
-                if (added[i]) curl_multi_remove_handle(multi, handles[i]);
-                if (handles[i]) curl_easy_cleanup(handles[i]);
-            }
-            if (result != CURLE_OK) goto done;
-            double before_write = seconds();
-            for (unsigned i = 0; i < count; i++) {
-                if (transfer_writer_enqueue(owner->writer, segment, parts[i].window_buffer,
-                                            (size_t)parts[i].written)) {
-                    result = CURLE_ABORTED_BY_CALLBACK; goto done;
-                }
-                owner->live[segment] += parts[i].written;
-            }
-            if (seconds() - before_write > 0.25)
-                owner->health = (DownloadHealth){seconds(), owner->network_bytes};
-            cursor = next;
-        }
-        /* A prior layout can have no saved bytes in its next range. Finish
-         * pending writes before crossing that boundary, even for a slow disk. */
-        if (transfer_writer_drain(owner->writer)) {
-            result = CURLE_ABORTED_BY_CALLBACK; goto done;
-        }
+        if (cursor >= limit) continue;
+        result = window_segment(w, segment, cursor, limit);
+        if (result == CURLE_OK && transfer_writer_drain(owner->writer)) result = CURLE_ABORTED_BY_CALLBACK;
     }
 done:
+    if (w) {
+        for (unsigned i = 0; i < WINDOW_MAX_CONNECTIONS; i++) {
+            WindowSlot *s = &w->slots[i];
+            if (s->busy) window_stop(w, s);
+#ifdef ORBIT_BENCHMARK
+            if (s->handle && s->used && owner->metrics) {
+                cJSON *m = cJSON_CreateObject();
+                cJSON_AddItemToArray(owner->metrics, m);
+                cJSON_AddNumberToObject(m, "range", i);
+                cJSON_AddNumberToObject(m, "bytes", (double)s->bytes);
+                cJSON_AddNumberToObject(m, "httpStatus", s->part.status);
+                cJSON_AddBoolToObject(m, "validated", !s->rejected);
+                cJSON_AddNumberToObject(m, "socketBufferBefore", s->part.socket_before);
+                cJSON_AddNumberToObject(m, "socketBufferAfter", s->part.socket_after);
+                cJSON_AddNumberToObject(m, "socketOptionError", s->part.socket_error);
+            }
+#endif
+            if (s->handle) curl_easy_cleanup(s->handle);
+        }
+        for (unsigned k = 0; k < w->count; k++) free(window_piece(w, k)->data);
+        OPENSSL_cleanse(w->pin, sizeof w->pin);
+    }
     if (multi) curl_multi_cleanup(multi);
-    free(memory);
+    free(w);
     if (result != CURLE_OK && !owner->error[0])
         snprintf(owner->error, sizeof owner->error, "Transfer interrupted: %s.", curl_easy_strerror(result));
     return result;
@@ -798,8 +1112,8 @@ cJSON *transfer_benchmark(Job *j, int fd, unsigned count, int64_t bytes, unsigne
     if (!conditions) { rc = CURLE_OUT_OF_MEMORY; goto finish_benchmark; }
     if (!strcmp(j->release.source, "archive") && range_support(&t, conditions, &rc) != 1)
         goto finish_benchmark;
-    j->range_count = count; j->segmented = true; j->total = bytes;
-    t.sample_span = bytes; t.probe = false;
+    j->range_count = 1; j->segmented = true; j->total = bytes;
+    t.sample_span = bytes; t.probe = false; t.fixed_connections = count;
     if (fsync(fd) || state_save_locked()) {
         copy_text(t.error, sizeof t.error, "Benchmark state could not be saved.");
         goto finish_benchmark;
@@ -815,7 +1129,7 @@ cJSON *transfer_benchmark(Job *j, int fd, unsigned count, int64_t bytes, unsigne
     cJSON_AddNumberToObject(initial_sample, "seconds", 0);
     cJSON_AddNumberToObject(initial_sample, "bytes", 0);
     cJSON_AddItemToArray(t.speed_samples, initial_sample);
-    rc = run_ranges(&t, conditions);
+    rc = run_window(&t, conditions);
     /* curl's millisecond timeout is rounded down when handles are prepared. */
     cJSON_AddBoolToObject(out, "timeLimitReached", seconds() >= t.deadline ||
         (rc == CURLE_OPERATION_TIMEDOUT && seconds() + .01 >= t.deadline));
@@ -1160,23 +1474,18 @@ static void run_job(Job *j) {
         copy_text(t.error, sizeof t.error, "Could not prepare source identity check.");
         goto finish;
     }
-    bool usb = usb_destination(j), usb_parallel = false;
     bool single_connection = !strcmp(r->source, "1fichier") && strcmp(j->delivery, "torbox");
+    /* Ranged downloads use the window engine with one durable cursor on every
+     * drive. Small remainders and hosts without ranges use one request. */
+    bool windowed = false;
+    if (!single_connection && j->etag[0] && (!j->segmented || j->range_count == 1) &&
+        r->size - t.offset >= PARALLEL_MIN_REMAINING) {
+        int supported = viking ? 1 : range_support(&t, conditions, &rc);
+        if (supported < 0) goto finish;
+        windowed = supported == 1;
+    }
     if (!j->segmented) {
-        unsigned count = ORBIT_MAX_RANGES;
-#ifdef ORBIT_TEST
-        const char *connections = getenv("ORBIT_TEST_CONNECTIONS");
-        if (connections && !strcmp(connections, "2")) count = 2;
-        else if (connections && !strcmp(connections, "4")) count = 4;
-#endif
-        bool parallel = false;
-        if (!single_connection && j->etag[0] && t.offset < range_boundary(r->size, count, 1) &&
-            r->size - t.offset >= PARALLEL_MIN_REMAINING) {
-            int supported = viking ? 1 : range_support(&t, conditions, &rc);
-            if (supported < 0) goto finish;
-            parallel = supported == 1;
-        }
-        /* Persist the layout before starting the writer or writing any tail.
+        /* Persist the layout before starting the writer or writing any byte.
          * Single-connection downloads also use a durable cursor, not st_size. */
         if (fsync(t.fd)) {
             copy_text(t.error, sizeof t.error, "Could not flush the existing partial file.");
@@ -1185,8 +1494,7 @@ static void run_job(Job *j) {
         t.live[0] = t.offset;
         pthread_mutex_lock(&orbit.mutex);
         j->segmented = true;
-        j->range_count = parallel && !usb ? count : 1;
-        usb_parallel = parallel && usb;
+        j->range_count = 1;
         j->range_received[0] = t.offset;
         saved = state_save_locked();
         pthread_mutex_unlock(&orbit.mutex);
@@ -1195,25 +1503,17 @@ static void run_job(Job *j) {
             goto finish;
         }
     }
-    /* A one-cursor USB job may have used either range windows or a host that
-     * ignores ranges. Recheck on resume; do not require a new queue schema. */
-    if (!single_connection && usb && !usb_parallel && j->etag[0] && t.offset < r->size) {
-        int supported = viking ? 1 : range_support(&t, conditions, &rc);
-        if (supported < 0) goto finish;
-        usb_parallel = supported == 1;
-    }
     if (t.offset < r->size) {
         t.probe = false;
         t.started = seconds();
         t.health = (DownloadHealth){t.started, 0};
         pthread_mutex_lock(&orbit.mutex);
-        j->transfer_connections = download_connections(usb && (usb_parallel || j->range_count > 1)
-            ? ORBIT_MAX_RANGES : j->range_count, j->attempts);
+        j->transfer_connections = 1;
         pthread_mutex_unlock(&orbit.mutex);
         t.writer = transfer_writer_start(j, t.fd, t.started, t.error, sizeof t.error);
         if (!t.writer) goto finish;
-        if (usb_parallel || j->range_count > 1) {
-            rc = usb ? run_usb_ranges(&t, conditions) : run_ranges(&t, conditions);
+        if (windowed || j->range_count > 1) {
+            rc = run_window(&t, conditions);
             if (rc != CURLE_OK || t.error[0]) goto finish;
         } else {
             c = request(&t);
